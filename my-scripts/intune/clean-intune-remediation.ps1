@@ -22,6 +22,9 @@ SYSTEM context (intentional - do not flag in reviews):
 - This script handles system-side plumbing (IME caches, DO cache, services,
   provisioned registrations). User-side recovery is completed by the end user
   running Company Portal -> Sync + retry install.
+- When run BY IME (deployed remediation), restarting IntuneManagementExtension
+  breaks the result-reporting callback and the portal action stays Pending.
+  We detect the parent process and skip IME restarts in that case.
 #>
 
 $ErrorActionPreference = "Continue"
@@ -142,6 +145,24 @@ function Try-RestartServiceSafe {
         } | Out-Null
 }
 
+function Test-RunningUnderIME {
+    # Returns $true when the script is executed by the Intune Management
+    # Extension (via AgentExecutor.exe). In that context, restarting the
+    # IntuneManagementExtension service kills the result-reporting callback:
+    # the portal action stays "Pending" forever even though the script
+    # completed successfully. Callers should skip IME restarts in that case.
+    # When launched via PsExec / manually, the parent is powershell/cmd/PsExec
+    # and restarting IME is fine (and desirable for full cleanup).
+    try {
+        $parentId = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop).ParentProcessId
+        if (-not $parentId) { return $false }
+        $parentName = (Get-Process -Id $parentId -ErrorAction SilentlyContinue).Name
+        return @("AgentExecutor","IntuneManagementExtension") -contains $parentName
+    } catch {
+        return $false
+    }
+}
+
 function Safe-RemoveChildren {
     param(
         [Parameter(Mandatory=$true)][string]$Path
@@ -173,6 +194,13 @@ $mode = if ($KillStuckInstallerProcesses -or $EnableHardResetAppX) { "AGGRESSIVE
 Write-Log ("=== START {0} Remediation: IME + Store/DO cleanup ===" -f $mode) "INFO"
 Write-Log ("Running as: {0}\{1} | PowerShell: {2}" -f $env:USERDOMAIN, $env:USERNAME, $PSVersionTable.PSVersion) "INFO"
 
+$UnderIME = Test-RunningUnderIME
+if ($UnderIME) {
+    Write-Log "Parent process is IME/AgentExecutor -> IntuneManagementExtension restarts will be SKIPPED (avoids breaking the portal result callback)." "WARN"
+} else {
+    Write-Log "Parent process is not IME -> IntuneManagementExtension will be restarted as usual." "INFO"
+}
+
 # -----------------------------
 # 1) Restart key services (safe with timeout)
 # -----------------------------
@@ -184,6 +212,10 @@ $services = @(
 )
 
 foreach ($s in $services) {
+    if ($UnderIME -and $s -eq "IntuneManagementExtension") {
+        Write-Log "Skipping restart of $s (running under IME - would break result callback)." "INFO"
+        continue
+    }
     Write-Log "Attempting service restart: $s" "INFO"
     Try-RestartServiceSafe -Name $s
 }
@@ -345,10 +377,14 @@ if ($EnableHardResetAppX) {
 }
 
 # -----------------------------
-# 7) Final IME restart to trigger re-evaluation (safe)
+# 7) Final IME restart to trigger re-evaluation (skipped under IME)
 # -----------------------------
-Write-Log "Final restart of IntuneManagementExtension (to trigger re-evaluation)..." "INFO"
-Try-RestartServiceSafe -Name "IntuneManagementExtension"
+if ($UnderIME) {
+    Write-Log "Skipping final IntuneManagementExtension restart (running under IME - the service handles re-evaluation on its next cycle)." "INFO"
+} else {
+    Write-Log "Final restart of IntuneManagementExtension (to trigger re-evaluation)..." "INFO"
+    Try-RestartServiceSafe -Name "IntuneManagementExtension"
+}
 
 Write-Log "=== END Remediation. Next: user closes Company Portal, reopens it, runs Sync, then retries install. ===" "INFO"
 Write-Log ("Log file: {0}" -f $LogFile) "INFO"
