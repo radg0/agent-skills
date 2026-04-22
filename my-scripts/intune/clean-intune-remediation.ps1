@@ -1,13 +1,27 @@
 <#
-Intune Proactive — SAFE Remediation (no detection, always runs)
+Intune Proactive — AGGRESSIVE Remediation (no detection, always runs)
 - Avoids hanging: timeouts around service actions and wsreset
-- Cleans IME caches + Delivery Optimization cache
-- Optional aggressive process kill and AppX re-register are disabled by default (safe)
-- Logs to: C:\_AutoPTasks\Log-Remediation\Intune-Remediation-Clean-YYYY-MM-DD.log
+- Cleans IME caches + Delivery Optimization caches (both DO locations)
+- Bounces wuauserv / BITS / DoSvc around the WU+DO cache wipe
+- Optional: wipes C:\Windows\SoftwareDistribution\Download (WU-reset, off by default)
+- Aggressive process kill and AppX re-register are ENABLED by default
+  (set $KillStuckInstallerProcesses / $EnableHardResetAppX to $false for safe mode)
+- Structured log:  C:\_AutoPTasks\Log-Remediation\Intune-Remediation-Clean-YYYY-MM-DD.log
+- Transcript:     C:\_AutoPTasks\Log-Remediation\Intune-Remediation-Transcript-YYYY-MM-DD.log
+- Intune stdout: one single summary line (portal truncates at 2048 chars)
 
 Recommended Intune settings:
 - Run in 64-bit PowerShell: Yes
 - Run using logged-on credentials: Optional (SYSTEM is fine)
+
+SYSTEM context (intentional - do not flag in reviews):
+- This script is deployed as NT AUTHORITY\SYSTEM via Intune Proactive Remediations.
+- wsreset.exe and Add-AppxPackage -Register have limited per-user effect when
+  invoked from SYSTEM (they touch the SYSTEM profile / provisioned packages,
+  not the logged-on user's AppX hive). This is accepted by design.
+- This script handles system-side plumbing (IME caches, DO cache, services,
+  provisioned registrations). User-side recovery is completed by the end user
+  running Company Portal -> Sync + retry install.
 #>
 
 $ErrorActionPreference = "Continue"
@@ -15,13 +29,18 @@ $ErrorActionPreference = "Continue"
 # -----------------------------
 # Logging
 # -----------------------------
-$LogDir  = "C:\_AutoPTasks\Log-Remediation"
-$DateStr = (Get-Date).ToString("yyyy-MM-dd")
-$LogFile = Join-Path $LogDir ("Intune-Remediation-Clean-{0}.log" -f $DateStr)
+$LogDir         = "C:\_AutoPTasks\Log-Remediation"
+$DateStr        = (Get-Date).ToString("yyyy-MM-dd")
+$LogFile        = Join-Path $LogDir ("Intune-Remediation-Clean-{0}.log"      -f $DateStr)
+$TranscriptFile = Join-Path $LogDir ("Intune-Remediation-Transcript-{0}.log" -f $DateStr)
 
 if (-not (Test-Path $LogDir)) {
     New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
 }
+
+# Transcript captures cmdlet errors/warnings/verbose that Write-Log would miss.
+# Intune only sees stdout (first 2048 chars), so we do NOT echo Write-Log lines there.
+try { Start-Transcript -Path $TranscriptFile -Append -Force | Out-Null } catch {}
 
 function Write-Log {
     param(
@@ -33,17 +52,18 @@ function Write-Log {
     $line = "[{0}] [{1}] {2}" -f $ts, $Level, $Message
 
     try { Add-Content -Path $LogFile -Value $line -Encoding UTF8 } catch {}
-    Write-Output $line
 }
 
 # -----------------------------
-# Toggles (SAFE defaults)
+# Toggles (AGGRESSIVE defaults - flip to $false for safe mode)
 # -----------------------------
-$KillStuckInstallerProcesses = $true  # SAFE default: do not kill processes
-$EnableHardResetAppX         = $true  # SAFE default: do not re-register AppX
-$ClearDOAlways               = $true   # SAFE: clearing DO cache is usually harmless and effective
+$KillStuckInstallerProcesses = $true   # AGGRESSIVE: kill Store/AppX processes (may disrupt in-flight installs)
+$EnableHardResetAppX         = $true   # AGGRESSIVE: re-register Store/AppInstaller/CompanyPortal
+$ClearDOAlways               = $true   # SAFE: clearing DO caches is usually harmless and effective
+$ClearWUDownloadCache        = $false  # HEAVIER: also wipe C:\Windows\SoftwareDistribution\Download (WU-reset)
 $ServiceActionTimeoutSeconds = 20
 $WsResetTimeoutSeconds       = 25
+$WUDOCleanupTimeoutSeconds   = 90      # wuauserv stop can be slow when WU has pending transactions
 
 # -----------------------------
 # Helpers (timeouts)
@@ -52,17 +72,35 @@ function Invoke-WithTimeout {
     param(
         [Parameter(Mandatory=$true)][scriptblock]$ScriptBlock,
         [Parameter(Mandatory=$true)][int]$TimeoutSeconds,
-        [string]$Description = "Operation"
+        [string]$Description = "Operation",
+        # Start-Job runs in a separate PowerShell process: variables from the
+        # caller's scope are NOT visible inside $ScriptBlock (closures don't
+        # survive the process boundary). All inputs MUST be passed explicitly.
+        [object[]]$ArgumentList = @(),
+        # Process names to kill if the job times out. Stop-Job does not
+        # reliably kill grandchildren (e.g. wsreset.exe launched via
+        # Start-Process -Wait), so we clean them up here to avoid orphans.
+        [string[]]$OrphanProcessNames = @()
     )
 
     $job = $null
     try {
-        $job = Start-Job -ScriptBlock $ScriptBlock
+        $job = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
         $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
         if (-not $completed) {
             Write-Log "$Description timed out after $TimeoutSeconds seconds." "WARN"
             Stop-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
             Remove-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
+
+            foreach ($pn in $OrphanProcessNames) {
+                try {
+                    $orphans = Get-Process -Name $pn -ErrorAction SilentlyContinue
+                    if ($orphans) {
+                        $orphans | Stop-Process -Force -ErrorAction SilentlyContinue
+                        Write-Log "Killed orphan process after timeout: $pn" "WARN"
+                    }
+                } catch {}
+            }
             return $false
         }
 
@@ -93,11 +131,15 @@ function Try-RestartServiceSafe {
         return
     }
 
-    Invoke-WithTimeout -TimeoutSeconds $ServiceActionTimeoutSeconds -Description "Restart service $Name" -ScriptBlock {
-        param($svcName)
-        Restart-Service -Name $svcName -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
-    }.GetNewClosure() | Out-Null
+    Invoke-WithTimeout `
+        -TimeoutSeconds $ServiceActionTimeoutSeconds `
+        -Description "Restart service $Name" `
+        -ArgumentList $Name `
+        -ScriptBlock {
+            param($svcName)
+            Restart-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        } | Out-Null
 }
 
 function Safe-RemoveChildren {
@@ -127,7 +169,8 @@ function Safe-RemoveChildren {
 # -----------------------------
 # Start
 # -----------------------------
-Write-Log "=== START SAFE Remediation: IME + Store/DO cleanup ===" "INFO"
+$mode = if ($KillStuckInstallerProcesses -or $EnableHardResetAppX) { "AGGRESSIVE" } else { "SAFE" }
+Write-Log ("=== START {0} Remediation: IME + Store/DO cleanup ===" -f $mode) "INFO"
 Write-Log ("Running as: {0}\{1} | PowerShell: {2}" -f $env:USERDOMAIN, $env:USERNAME, $PSVersionTable.PSVersion) "INFO"
 
 # -----------------------------
@@ -146,11 +189,14 @@ foreach ($s in $services) {
 }
 
 # -----------------------------
-# 2) Optional: kill stuck installer processes (disabled by default)
+# 2) Kill stuck installer processes (enabled by default, gated by toggle)
 # -----------------------------
 if ($KillStuckInstallerProcesses) {
     Write-Log "Aggressive mode enabled: stopping potentially stuck processes." "WARN"
-    $procs = @("AppInstaller","WinStore.App","Microsoft.StorePurchaseApp","wsappx")
+    # Do NOT include "wsappx" here: it hosts AppXSvc and ClipSVC, and killing
+    # it can corrupt the AppX deployment queue for any install in flight. The
+    # AppXSvc restart earlier in this script is the safer way to bounce it.
+    $procs = @("AppInstaller","WinStore.App","Microsoft.StorePurchaseApp")
     foreach ($p in $procs) {
         try {
             Get-Process -Name $p -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -179,31 +225,64 @@ foreach ($p in $imeTargets) {
 }
 
 # -----------------------------
-# 4) Clean Delivery Optimization cache (safe)
+# 4) Clean Delivery Optimization + Windows Update caches
 # -----------------------------
-$doCache = "C:\ProgramData\Microsoft\Windows\DeliveryOptimization\Cache"
-Write-Log "Cleaning Delivery Optimization cache..." "INFO"
+# Two DO cache locations exist depending on who initiated the download:
+#   - ProgramData\...\DeliveryOptimization\Cache  -> generic DO (Store, Intune Win32 via DO)
+#   - SoftwareDistribution\DeliveryOptimization\Cache -> DO for wuauserv-initiated downloads
+# We clean BOTH and bounce wuauserv/BITS/DoSvc together, matching the manual
+# procedure that unblocks Company Portal installs on real endpoints.
+$doCacheProgramData = "C:\ProgramData\Microsoft\Windows\DeliveryOptimization\Cache"
+$doCacheWU          = "C:\Windows\SoftwareDistribution\DeliveryOptimization\Cache"
+$wuDownload         = "C:\Windows\SoftwareDistribution\Download"
 
-Invoke-WithTimeout -TimeoutSeconds 25 -Description "DO cache cleanup" -ScriptBlock {
-    param($cachePath, $clearAlways)
+Write-Log "Cleaning WU + DO caches (bouncing wuauserv / BITS / DoSvc)..." "INFO"
 
-    # Stop service to release locks
-    Stop-Service -Name DoSvc -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+Invoke-WithTimeout `
+    -TimeoutSeconds $WUDOCleanupTimeoutSeconds `
+    -Description "WU + DO cache cleanup" `
+    -ArgumentList @($doCacheProgramData, $doCacheWU, $wuDownload, $ClearDOAlways, $ClearWUDownloadCache) `
+    -ScriptBlock {
+        param($doPath1, $doPath2, $wuDownloadPath, $clearDO, $clearWU)
 
-    if (Test-Path $cachePath) {
-        if ($clearAlways) {
-            Get-ChildItem -Path $cachePath -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        # Stop order: wuauserv first (it drives BITS/DoSvc for updates), then
+        # the transports. Reverse order on restart so dependencies are up
+        # before dependents try to bind.
+        foreach ($s in "wuauserv","BITS","DoSvc") {
+            Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
         }
+        Start-Sleep -Seconds 2
+
+        if ($clearDO) {
+            foreach ($p in @($doPath1, $doPath2)) {
+                if (Test-Path $p) {
+                    Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue |
+                        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        if ($clearWU -and (Test-Path $wuDownloadPath)) {
+            Get-ChildItem -Path $wuDownloadPath -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        foreach ($s in "DoSvc","BITS","wuauserv") {
+            Start-Service -Name $s -ErrorAction SilentlyContinue
+        }
+    } | Out-Null
+
+foreach ($p in @($doCacheProgramData, $doCacheWU)) {
+    if (Test-Path $p) {
+        Write-Log "DO cache cleanup attempted: $p" "INFO"
+    } else {
+        Write-Log "DO cache path not found: $p" "INFO"
     }
-
-    Start-Service -Name DoSvc -ErrorAction SilentlyContinue
-}.GetNewClosure() | Out-Null
-
-if (Test-Path $doCache) {
-    Write-Log "DO cache cleanup attempted: $doCache" "INFO"
+}
+if ($ClearWUDownloadCache) {
+    Write-Log "WU Download folder cleanup attempted: $wuDownload" "INFO"
 } else {
-    Write-Log "DO cache path not found: $doCache" "INFO"
+    Write-Log "WU Download folder preserved (toggle off)." "INFO"
 }
 
 # -----------------------------
@@ -213,11 +292,16 @@ $wsreset = "$env:windir\System32\wsreset.exe"
 if (Test-Path $wsreset) {
     Write-Log "Running wsreset.exe (best effort)..." "INFO"
 
-    Invoke-WithTimeout -TimeoutSeconds $WsResetTimeoutSeconds -Description "wsreset" -ScriptBlock {
-        param($exePath)
-        # /quiet is not always honored on all builds; keep it but don't rely on it
-        Start-Process -FilePath $exePath -ArgumentList "/quiet" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
-    }.GetNewClosure() | Out-Null
+    Invoke-WithTimeout `
+        -TimeoutSeconds $WsResetTimeoutSeconds `
+        -Description "wsreset" `
+        -ArgumentList $wsreset `
+        -OrphanProcessNames @("wsreset") `
+        -ScriptBlock {
+            param($exePath)
+            # /quiet is not always honored on all builds; keep it but don't rely on it
+            Start-Process -FilePath $exePath -ArgumentList "/quiet" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+        } | Out-Null
 
     Write-Log "wsreset attempted." "INFO"
 } else {
@@ -225,29 +309,35 @@ if (Test-Path $wsreset) {
 }
 
 # -----------------------------
-# 6) Optional: Hard reset AppX (disabled by default)
+# 6) Hard reset AppX (enabled by default, gated by toggle)
 # -----------------------------
 if ($EnableHardResetAppX) {
     Write-Log "Hard reset AppX enabled (heavier). Re-registering Store/AppInstaller/CompanyPortal..." "WARN"
 
     $packages = @("Microsoft.WindowsStore","Microsoft.DesktopAppInstaller","Microsoft.CompanyPortal")
 
-    Invoke-WithTimeout -TimeoutSeconds 60 -Description "AppX re-register" -ScriptBlock {
-        param($pkgList)
-        foreach ($pkg in $pkgList) {
-            $pkgs = Get-AppxPackage -AllUsers -Name $pkg -ErrorAction SilentlyContinue
-            if ($pkgs) {
-                foreach ($p in $pkgs) {
-                    if ($p.InstallLocation) {
-                        $manifest = Join-Path $p.InstallLocation "AppxManifest.xml"
-                        if (Test-Path $manifest) {
-                            Add-AppxPackage -DisableDevelopmentMode -Register $manifest -ErrorAction SilentlyContinue
+    # ,$packages wraps the array as a single argument so the job receives the
+    # whole list (Start-Job -ArgumentList otherwise unrolls arrays).
+    Invoke-WithTimeout `
+        -TimeoutSeconds 60 `
+        -Description "AppX re-register" `
+        -ArgumentList (,$packages) `
+        -ScriptBlock {
+            param($pkgList)
+            foreach ($pkg in $pkgList) {
+                $pkgs = Get-AppxPackage -AllUsers -Name $pkg -ErrorAction SilentlyContinue
+                if ($pkgs) {
+                    foreach ($p in $pkgs) {
+                        if ($p.InstallLocation) {
+                            $manifest = Join-Path $p.InstallLocation "AppxManifest.xml"
+                            if (Test-Path $manifest) {
+                                Add-AppxPackage -DisableDevelopmentMode -Register $manifest -ErrorAction SilentlyContinue
+                            }
                         }
                     }
                 }
             }
-        }
-    }.GetNewClosure() | Out-Null
+        } | Out-Null
 
     Write-Log "Hard reset AppX attempted." "INFO"
 } else {
@@ -260,7 +350,12 @@ if ($EnableHardResetAppX) {
 Write-Log "Final restart of IntuneManagementExtension (to trigger re-evaluation)..." "INFO"
 Try-RestartServiceSafe -Name "IntuneManagementExtension"
 
-Write-Log "=== END Remediation. Next: user Sync in Company Portal + retry install. ===" "INFO"
+Write-Log "=== END Remediation. Next: user closes Company Portal, reopens it, runs Sync, then retries install. ===" "INFO"
 Write-Log ("Log file: {0}" -f $LogFile) "INFO"
+
+try { Stop-Transcript | Out-Null } catch {}
+
+# Single-line status for the Intune portal (stdout is truncated to 2048 chars).
+Write-Output ("IntuneRemediation: completed. Log={0}" -f $LogFile)
 
 exit 0
