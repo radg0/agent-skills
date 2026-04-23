@@ -4,6 +4,9 @@ Intune Proactive — AGGRESSIVE Remediation (no detection, always runs)
 - Cleans IME caches + Delivery Optimization caches (both DO locations)
 - Bounces wuauserv / BITS / DoSvc around the WU+DO cache wipe
 - Optional: wipes C:\Windows\SoftwareDistribution\Download (WU-reset, off by default)
+- Clears stale MSI InProgress markers when no install is active (fixes
+  winget / Company Portal "Waiting for another install/uninstall" hangs
+  caused by a prior MSI install that crashed without cleanup)
 - Aggressive process kill and AppX re-register are ENABLED by default
   (set $KillStuckInstallerProcesses / $EnableHardResetAppX to $false for safe mode)
 - Structured log:  C:\_AutoPTasks\Log-Remediation\Intune-Remediation-Clean-YYYY-MM-DD.log
@@ -64,6 +67,8 @@ $KillStuckInstallerProcesses = $true   # AGGRESSIVE: kill Store/AppX processes (
 $EnableHardResetAppX         = $true   # AGGRESSIVE: re-register Store/AppInstaller/CompanyPortal
 $ClearDOAlways               = $true   # SAFE: clearing DO caches is usually harmless and effective
 $ClearWUDownloadCache        = $false  # HEAVIER: also wipe C:\Windows\SoftwareDistribution\Download (WU-reset)
+$ClearStaleMsiState          = $true   # SAFE-gated: restart msiserver + clear InProgress registry markers
+                                       # only when no non-service msiexec is running (aborts otherwise)
 $ServiceActionTimeoutSeconds = 20
 $WsResetTimeoutSeconds       = 25
 $WUDOCleanupTimeoutSeconds   = 90      # wuauserv stop can be slow when WU has pending transactions
@@ -377,7 +382,80 @@ if ($EnableHardResetAppX) {
 }
 
 # -----------------------------
-# 7) Final IME restart to trigger re-evaluation (skipped under IME)
+# 7) MSI state recovery - clear stale InProgress markers from crashed installs
+# -----------------------------
+# When a Win32 MSI install (via IME / Company Portal / winget) crashes or is
+# killed before completing, the Windows Installer service can keep entries in
+# HKLM:\...\Installer\InProgress that block all subsequent MSI transactions.
+# Symptom: winget hangs on "Waiting for another install/uninstall to complete"
+# even though no msiexec is actively running.
+#
+# Safety gate: we only clean when exactly 0 non-service msiexec processes
+# are running, so an in-flight install is never disrupted.
+if ($ClearStaleMsiState) {
+    Write-Log "MSI state recovery requested: checking for active installs first..." "INFO"
+
+    $msiServiceInfo = Get-CimInstance -ClassName Win32_Service -Filter "Name='msiserver'" -ErrorAction SilentlyContinue
+    $msiServicePid  = if ($msiServiceInfo) { [int]$msiServiceInfo.ProcessId } else { 0 }
+    $msiProcs       = @(Get-Process -Name 'msiexec' -ErrorAction SilentlyContinue)
+    $nonServiceMsi  = @($msiProcs | Where-Object { $_.Id -ne $msiServicePid })
+
+    if ($nonServiceMsi.Count -gt 0) {
+        $pidList = ($nonServiceMsi | ForEach-Object { $_.Id }) -join ','
+        Write-Log ("MSI state recovery SKIPPED: {0} non-service msiexec process(es) running (PIDs: {1})." -f $nonServiceMsi.Count, $pidList) "WARN"
+    } else {
+        Write-Log "No active MSI installs detected - proceeding with recovery." "INFO"
+
+        Invoke-WithTimeout `
+            -TimeoutSeconds $ServiceActionTimeoutSeconds `
+            -Description "Stop msiserver" `
+            -ArgumentList "msiserver" `
+            -ScriptBlock {
+                param($svcName)
+                Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+            } | Out-Null
+
+        $msiKeys = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\Rollback\Scripts'
+        )
+
+        foreach ($key in $msiKeys) {
+            if (-not (Test-Path $key)) {
+                Write-Log "Registry key not present: $key" "INFO"
+                continue
+            }
+
+            try {
+                $item = Get-Item -Path $key -ErrorAction SilentlyContinue
+                if (-not $item -or $item.ValueCount -eq 0) {
+                    Write-Log "No stale values in $key" "INFO"
+                    continue
+                }
+
+                Write-Log ("Clearing {0} stale value(s) from {1}" -f $item.ValueCount, $key) "WARN"
+                foreach ($name in $item.Property) {
+                    try {
+                        Remove-ItemProperty -Path $key -Name $name -Force -ErrorAction Stop
+                    } catch {
+                        Write-Log ("Could not remove {0}\{1}: {2}" -f $key, $name, $_.Exception.Message) "WARN"
+                    }
+                }
+            } catch {
+                Write-Log ("Failed to inspect {0}: {1}" -f $key, $_.Exception.Message) "WARN"
+            }
+        }
+
+        # msiserver is Manual/StartOnDemand: the next MSI API call brings it
+        # back up automatically. No explicit Start-Service needed.
+        Write-Log "MSI state recovery attempted." "INFO"
+    }
+} else {
+    Write-Log "MSI state recovery disabled by toggle." "INFO"
+}
+
+# -----------------------------
+# 8) Final IME restart to trigger re-evaluation (skipped under IME)
 # -----------------------------
 if ($UnderIME) {
     Write-Log "Skipping final IntuneManagementExtension restart (running under IME - the service handles re-evaluation on its next cycle)." "INFO"

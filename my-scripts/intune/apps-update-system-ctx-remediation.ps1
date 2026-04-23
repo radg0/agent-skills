@@ -205,13 +205,132 @@ function Test-WingetUpgradeAvailable {
     return ($output -match [regex]::Escape($PackageId))
 }
 
+function Get-MsiStuckStateDiagnostic {
+    # Broad diagnostic for any blocker of a winget install: MSI mutex holders,
+    # Windows App SDK / AppX / IME processes that serialize installs, service
+    # states, stale registry markers, pending reboot, recent MsiInstaller events.
+    $diag = New-Object System.Collections.Generic.List[string]
+
+    # msiexec processes (always log count, even 0)
+    try {
+        $procs = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='msiexec.exe'" -ErrorAction SilentlyContinue)
+        if ($procs.Count -eq 0) {
+            $diag.Add("msiexec: 0 processes running") | Out-Null
+        }
+        else {
+            foreach ($p in $procs) {
+                $cmd = if ($p.CommandLine) { $p.CommandLine.Trim() } else { '(no command line)' }
+                if ($cmd.Length -gt 200) { $cmd = $cmd.Substring(0, 200) + '...' }
+                $diag.Add("msiexec PID=$($p.ProcessId) Parent=$($p.ParentProcessId) : $cmd") | Out-Null
+            }
+        }
+    } catch {
+        $diag.Add("msiexec enumeration failed: $($_.Exception.Message)") | Out-Null
+    }
+
+    # Install-related processes that can serialize with winget outside of MSI
+    try {
+        $names = 'AgentExecutor','IntuneManagementExtension','WinGet','AppInstaller','AppInstallerCLI','WindowsPackageManagerServer','TrustedInstaller'
+        $running = @(Get-Process -Name $names -ErrorAction SilentlyContinue)
+        foreach ($p in $running) {
+            $cmd = '(no cmdline)'
+            try {
+                $cim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction SilentlyContinue
+                if ($cim -and $cim.CommandLine) {
+                    $cmd = $cim.CommandLine.Trim()
+                    if ($cmd.Length -gt 200) { $cmd = $cmd.Substring(0, 200) + '...' }
+                }
+            } catch {}
+            $diag.Add("$($p.ProcessName) PID=$($p.Id) : $cmd") | Out-Null
+        }
+    } catch {}
+
+    # Service states
+    try {
+        $services = Get-Service -Name 'msiserver','TrustedInstaller','AppXSvc','IntuneManagementExtension' -ErrorAction SilentlyContinue
+        foreach ($s in $services) {
+            $diag.Add("Service $($s.Name) : $($s.Status)") | Out-Null
+        }
+    } catch {}
+
+    # Pending reboot indicators (classic MSI blockers)
+    $rebootKeys = @{
+        'CBS RebootPending'       = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+        'WU RebootRequired'       = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+        'CBS PackagesPending'     = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
+    }
+    foreach ($k in $rebootKeys.Keys) {
+        if (Test-Path $rebootKeys[$k]) {
+            $diag.Add("Pending reboot flag : $k ($($rebootKeys[$k]))") | Out-Null
+        }
+    }
+    try {
+        $pfro = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+        if ($pfro.PendingFileRenameOperations) {
+            $diag.Add("Pending reboot flag : PendingFileRenameOperations ($($pfro.PendingFileRenameOperations.Count) entries)") | Out-Null
+        }
+    } catch {}
+
+    # Stale Installer registry markers
+    foreach ($key in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\Rollback\Scripts'
+    )) {
+        if (Test-Path $key) {
+            try {
+                $item = Get-Item -Path $key -ErrorAction SilentlyContinue
+                if ($item -and $item.ValueCount -gt 0) {
+                    $diag.Add("Registry marker: $key has $($item.ValueCount) value(s)") | Out-Null
+                }
+            } catch {}
+        }
+    }
+
+    # Rollback files (indicate crashed MSI transaction)
+    try {
+        $rbfCount = @(Get-ChildItem -Path 'C:\Windows\Installer' -Filter '*.rbf' -Force -ErrorAction SilentlyContinue).Count
+        if ($rbfCount -gt 0) {
+            $diag.Add("Rollback files : $rbfCount *.rbf files in C:\Windows\Installer") | Out-Null
+        }
+    } catch {}
+
+    # Last 3 MsiInstaller events - reveal what MSI was last doing
+    try {
+        $events = Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='MsiInstaller'} -MaxEvents 3 -ErrorAction SilentlyContinue
+        foreach ($e in $events) {
+            $msg = ($e.Message -split "`r?`n")[0].Trim()
+            if ($msg.Length -gt 180) { $msg = $msg.Substring(0, 180) + '...' }
+            $diag.Add("MsiEvent $($e.Id) @ $($e.TimeCreated.ToString('HH:mm:ss')) : $msg") | Out-Null
+        }
+    } catch {}
+
+    return $diag
+}
+
+function Read-FileShared {
+    # Shared read so we can poll a file that winget is still writing to.
+    param([string]$Path)
+
+    try {
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        $sr = New-Object System.IO.StreamReader($fs)
+        $content = $sr.ReadToEnd()
+        $sr.Close(); $fs.Close()
+        return $content
+    } catch {
+        return ''
+    }
+}
+
 function Invoke-WingetProcess {
     param(
         [string]$WingetPath,
         [string]$Arguments,
         [string]$OperationLabel,
         [string]$PackageId,
-        [int]$TimeoutSeconds
+        [int]$TimeoutSeconds,
+        [int]$WaitingStateMaxSeconds = 60,
+        [int]$PollIntervalMs = 5000
     )
 
     $stdoutFile = [System.IO.Path]::GetTempFileName()
@@ -225,7 +344,41 @@ function Invoke-WingetProcess {
                                  -RedirectStandardOutput $stdoutFile `
                                  -RedirectStandardError  $stderrFile
 
-        $exited = $process.WaitForExit($TimeoutSeconds * 1000)
+        $deadline      = (Get-Date).AddSeconds($TimeoutSeconds)
+        $waitingSince  = $null
+        $stuckDetected = $false
+        $exited        = $false
+
+        while ((Get-Date) -lt $deadline) {
+            if ($process.WaitForExit($PollIntervalMs)) {
+                $exited = $true
+                break
+            }
+
+            $tail = Read-FileShared -Path $stdoutFile
+            if ($tail.Length -gt 1000) { $tail = $tail.Substring($tail.Length - 1000) }
+
+            if ($tail -match 'Waiting for another install') {
+                if (-not $waitingSince) {
+                    $waitingSince = Get-Date
+                    Write-Log "winget waiting for install lock [$PackageId] (will abort if stuck >${WaitingStateMaxSeconds}s)" 'WARN'
+                    foreach ($line in Get-MsiStuckStateDiagnostic) {
+                        Write-Log "Stuck-state diagnostic (at wait start) : $line" 'WARN'
+                    }
+                }
+                elseif (((Get-Date) - $waitingSince).TotalSeconds -ge $WaitingStateMaxSeconds) {
+                    Write-Log "winget stuck in 'Waiting' state >${WaitingStateMaxSeconds}s for $PackageId - aborting" 'ERROR'
+                    foreach ($line in Get-MsiStuckStateDiagnostic) {
+                        Write-Log "Stuck-state diagnostic (at abort) : $line" 'ERROR'
+                    }
+                    $stuckDetected = $true
+                    break
+                }
+            }
+            else {
+                $waitingSince = $null
+            }
+        }
 
         if (-not $exited) {
             try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
@@ -237,6 +390,10 @@ function Invoke-WingetProcess {
 
         if ($stdoutContent.Trim()) { Write-Log "$OperationLabel stdout [$PackageId] : $($stdoutContent.Trim())" }
         if ($stderrContent.Trim()) { Write-Log "$OperationLabel stderr [$PackageId] : $($stderrContent.Trim())" 'WARN' }
+
+        if ($stuckDetected) {
+            throw "winget $OperationLabel aborted: stuck in MSI 'Waiting' state for $PackageId (likely orphaned MSI lock from a prior failed install)"
+        }
 
         if (-not $exited) {
             throw "winget $OperationLabel timed out after $TimeoutSeconds seconds for package $PackageId"
@@ -358,8 +515,12 @@ try {
                 }
             }
             catch {
-                $FailedOps.Add("$DisplayName(install=err)") | Out-Null
-                Write-Log "Error while installing $DisplayName : $($_.Exception.Message)" 'ERROR'
+                $msg = $_.Exception.Message
+                $tag = if ($msg -match 'stuck in MSI') { 'msi-stuck' }
+                       elseif ($msg -match 'timed out') { 'timeout' }
+                       else { 'err' }
+                $FailedOps.Add("$DisplayName(install=$tag)") | Out-Null
+                Write-Log "Error while installing $DisplayName : $msg" 'ERROR'
                 $RemediationFailed = $true
             }
 
@@ -396,8 +557,12 @@ try {
                 }
             }
             catch {
-                $FailedOps.Add("$DisplayName(upgrade=err)") | Out-Null
-                Write-Log "Error while upgrading $DisplayName : $($_.Exception.Message)" 'ERROR'
+                $msg = $_.Exception.Message
+                $tag = if ($msg -match 'stuck in MSI') { 'msi-stuck' }
+                       elseif ($msg -match 'timed out') { 'timeout' }
+                       else { 'err' }
+                $FailedOps.Add("$DisplayName(upgrade=$tag)") | Out-Null
+                Write-Log "Error while upgrading $DisplayName : $msg" 'ERROR'
                 $RemediationFailed = $true
             }
         }
