@@ -109,6 +109,40 @@ function Get-WingetPath {
     return $wingetPath
 }
 
+function Ensure-MsiServiceRunning {
+    # Winget acquires the Windows Installer _MSIExecute mutex before any install
+    # (even non-MSI installers like Inno Setup / NSIS), and the mutex is only
+    # created when msiserver is actually running. If msiserver is Stopped and
+    # SCM auto-start is slow/broken, winget hangs on "Waiting for another
+    # install/uninstall to complete..." indefinitely. Pre-starting the service
+    # removes the dependency on auto-start.
+    $svc = Get-Service -Name 'msiserver' -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-Log "msiserver service not found - winget install/upgrade will likely hang" 'ERROR'
+        return $false
+    }
+    if ($svc.Status -eq 'Running') {
+        Write-Log "msiserver already running" 'OK'
+        return $true
+    }
+    try {
+        Write-Log "Starting msiserver (current status: $($svc.Status))" 'WARN'
+        Start-Service -Name 'msiserver' -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        $svc = Get-Service -Name 'msiserver' -ErrorAction SilentlyContinue
+        if ($svc.Status -eq 'Running') {
+            Write-Log "msiserver started successfully" 'OK'
+            return $true
+        }
+        Write-Log "msiserver status after start attempt: $($svc.Status)" 'WARN'
+        return $false
+    }
+    catch {
+        Write-Log "Failed to start msiserver: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+}
+
 function Wait-ForInstallerIdle {
     # Heuristic: msiexec.exe count <= 1 means only the MSI service is running (idle).
     # > 1 means another install/uninstall is holding the Windows Installer mutex.
@@ -209,7 +243,63 @@ function Get-MsiStuckStateDiagnostic {
     # Broad diagnostic for any blocker of a winget install: MSI mutex holders,
     # Windows App SDK / AppX / IME processes that serialize installs, service
     # states, stale registry markers, pending reboot, recent MsiInstaller events.
+    # Runs DURING the hang so we capture live state, not a stale snapshot.
     $diag = New-Object System.Collections.Generic.List[string]
+
+    # LIVE _MSIExecute mutex probe - tells us if winget is actually waiting on MSI
+    $m = $null
+    try {
+        $m = [System.Threading.Mutex]::OpenExisting('Global\_MSIExecute')
+        if ($m.WaitOne(500)) {
+            $diag.Add("_MSIExecute mutex: exists, acquirable (NOT held) - winget is NOT really waiting on MSI mutex") | Out-Null
+            $m.ReleaseMutex()
+        } else {
+            $diag.Add("_MSIExecute mutex: exists, HELD - winget is genuinely waiting on MSI") | Out-Null
+        }
+    } catch [System.Threading.WaitHandleCannotBeOpenedException] {
+        $diag.Add("_MSIExecute mutex: does not exist - winget CANNOT be waiting on a non-existent mutex") | Out-Null
+    } catch {
+        $diag.Add("_MSIExecute probe error: $($_.Exception.Message)") | Out-Null
+    } finally {
+        if ($m) { $m.Dispose() }
+    }
+
+    # WindowsPackageManagerServer: winget's COM server. Absent during hang = COM activation failed.
+    $wpms = @(Get-Process -Name 'WindowsPackageManagerServer' -ErrorAction SilentlyContinue)
+    if ($wpms.Count -eq 0) {
+        $diag.Add("WindowsPackageManagerServer: NOT running - winget likely hung on COM activation") | Out-Null
+    } else {
+        foreach ($p in $wpms) {
+            $age = try { [int]((Get-Date) - $p.StartTime).TotalSeconds } catch { -1 }
+            $diag.Add("WindowsPackageManagerServer PID=$($p.Id) Session=$($p.SessionId) StartedAgoSec=$age") | Out-Null
+        }
+    }
+
+    # Hung winget liveness: if CPU is not growing across calls, it's passively blocked
+    $wp = @(Get-Process -Name 'winget' -ErrorAction SilentlyContinue) | Select-Object -First 1
+    if ($wp) {
+        $cpu = try { [math]::Round($wp.CPU, 2) } catch { 'n/a' }
+        $diag.Add("winget PID=$($wp.Id) Threads=$($wp.Threads.Count) Handles=$($wp.HandleCount) CPU=${cpu}s") | Out-Null
+    }
+
+    # Critical: is DesktopAppInstaller registered for SYSTEM? If not, winget as
+    # SYSTEM can't activate its COM server and will hang.
+    try {
+        $sysPkg = Get-AppxPackage -User 'S-1-5-18' -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($sysPkg) {
+            $diag.Add("DesktopAppInstaller for SYSTEM: v$($sysPkg.Version) [$($sysPkg.Status)]") | Out-Null
+        } else {
+            $diag.Add("DesktopAppInstaller for SYSTEM: NOT REGISTERED - root cause candidate") | Out-Null
+        }
+        $srcPkg = Get-AppxPackage -User 'S-1-5-18' -Name 'Microsoft.Winget.Source' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($srcPkg) {
+            $diag.Add("Winget.Source for SYSTEM: v$($srcPkg.Version) [$($srcPkg.Status)]") | Out-Null
+        } else {
+            $diag.Add("Winget.Source for SYSTEM: NOT REGISTERED") | Out-Null
+        }
+    } catch {
+        $diag.Add("Per-SID AppX check error: $($_.Exception.Message)") | Out-Null
+    }
 
     # msiexec processes (always log count, even 0)
     try {
@@ -469,6 +559,11 @@ try {
 
     $WingetPath = Get-WingetPath
     Write-Log "Winget located at : $WingetPath" 'OK'
+
+    # Pre-flight: make sure msiserver is Running so winget does not hang on
+    # "Waiting for another install/uninstall to complete" when it acquires
+    # the MSI mutex (required even for non-MSI installer types).
+    Ensure-MsiServiceRunning | Out-Null
 
     foreach ($App in $Applications) {
         $PackageId         = $App.Id

@@ -349,9 +349,14 @@ if (Test-Path $wsreset) {
 # 6) Hard reset AppX (enabled by default, gated by toggle)
 # -----------------------------
 if ($EnableHardResetAppX) {
-    Write-Log "Hard reset AppX enabled (heavier). Re-registering Store/AppInstaller/CompanyPortal..." "WARN"
+    Write-Log "Hard reset AppX enabled (heavier). Re-registering Store/AppInstaller/CompanyPortal/WindowsAppRuntime..." "WARN"
 
-    $packages = @("Microsoft.WindowsStore","Microsoft.DesktopAppInstaller","Microsoft.CompanyPortal")
+    # Microsoft.WindowsAppRuntime.* is included because its upgrade (pushed silently by
+    # the Store) can leave the COM activation path of WindowsPackageManagerServer broken,
+    # which makes winget hang on "Waiting for another install/uninstall to complete"
+    # without any visible MSI contention. Re-registering the runtime repairs it.
+    # Wildcard matches all installed versions (1.5, 1.6, 1.7, 1.8, CBS variants).
+    $packages = @("Microsoft.WindowsStore","Microsoft.DesktopAppInstaller","Microsoft.CompanyPortal","Microsoft.WindowsAppRuntime.*")
 
     # ,$packages wraps the array as a single argument so the job receives the
     # whole list (Start-Job -ArgumentList otherwise unrolls arrays).
@@ -446,9 +451,25 @@ if ($ClearStaleMsiState) {
             }
         }
 
-        # msiserver is Manual/StartOnDemand: the next MSI API call brings it
-        # back up automatically. No explicit Start-Service needed.
-        Write-Log "MSI state recovery attempted." "INFO"
+        # msiserver must be restarted explicitly. Relying on SCM auto-start
+        # when a client calls MSI APIs is unreliable on some endpoints: winget
+        # then hangs indefinitely on "Waiting for another install/uninstall"
+        # because the _MSIExecute mutex is only created once msiserver runs.
+        Invoke-WithTimeout `
+            -TimeoutSeconds $ServiceActionTimeoutSeconds `
+            -Description "Start msiserver" `
+            -ArgumentList "msiserver" `
+            -ScriptBlock {
+                param($svcName)
+                Start-Service -Name $svcName -ErrorAction SilentlyContinue
+            } | Out-Null
+
+        $msiSvcAfter = Get-Service -Name 'msiserver' -ErrorAction SilentlyContinue
+        if ($msiSvcAfter -and $msiSvcAfter.Status -eq 'Running') {
+            Write-Log "MSI state recovery attempted (msiserver is Running)." "INFO"
+        } else {
+            Write-Log ("MSI state recovery attempted but msiserver is {0} - winget/MSI installs may hang until next boot." -f ($msiSvcAfter.Status)) "WARN"
+        }
     }
 } else {
     Write-Log "MSI state recovery disabled by toggle." "INFO"
