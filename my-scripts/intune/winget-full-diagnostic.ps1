@@ -177,26 +177,40 @@ function Get-AppxRegistrationBySid {
     $critical = @('Microsoft.DesktopAppInstaller','Microsoft.Winget.Source','Microsoft.WindowsAppRuntime.1.8')
 
     foreach ($sid in $sids) {
-        $account = '(unresolved)'
         try {
-            $account = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount]).Value
-        } catch {}
-        Write-Log ("--- {0}  ({1}) ---" -f $sid, $account)
+            $account = '(unresolved)'
+            try {
+                $account = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount]).Value
+            } catch {}
+            Write-Log ("--- {0}  ({1}) ---" -f $sid, $account)
 
-        foreach ($pkgName in $critical) {
-            $pkg = Get-AppxPackage -User $sid -Name $pkgName -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($pkg) {
-                Write-Log ("   {0,-40} : v{1} [{2}]" -f $pkgName, $pkg.Version, $pkg.Status)
-            }
-            else {
-                Write-Log ("   {0,-40} : NOT REGISTERED" -f $pkgName) 'WARN'
-                if ($sid -eq 'S-1-5-18' -and $pkgName -eq 'Microsoft.DesktopAppInstaller') {
-                    Add-Finding 'DesktopAppInstaller NOT registered for SYSTEM (S-1-5-18) - winget COM activation will fail/hang'
+            # Get-AppxPackage -User accepts SID or DOMAIN\user. Modern Azure AD SIDs
+            # (S-1-12-1-*) sometimes fail with -User <SID> but work with the resolved
+            # NTAccount name. Try the resolved name first, fall back to the SID.
+            $userArg = if ($account -ne '(unresolved)') { $account } else { $sid }
+
+            foreach ($pkgName in $critical) {
+                try {
+                    $pkg = Get-AppxPackage -User $userArg -Name $pkgName -ErrorAction Stop | Select-Object -First 1
+                    if ($pkg) {
+                        Write-Log ("   {0,-40} : v{1} [{2}]" -f $pkgName, $pkg.Version, $pkg.Status)
+                    } else {
+                        Write-Log ("   {0,-40} : NOT REGISTERED" -f $pkgName) 'WARN'
+                        if ($sid -eq 'S-1-5-18' -and $pkgName -eq 'Microsoft.DesktopAppInstaller') {
+                            Add-Finding 'DesktopAppInstaller NOT registered for SYSTEM (S-1-5-18) - winget COM activation will fail/hang'
+                        }
+                        elseif ($sid -eq 'S-1-5-18' -and $pkgName -eq 'Microsoft.Winget.Source') {
+                            Add-Finding 'Microsoft.Winget.Source NOT registered for SYSTEM - winget sources will be rebuilt in-memory every call'
+                        }
+                    }
                 }
-                elseif ($sid -eq 'S-1-5-18' -and $pkgName -eq 'Microsoft.Winget.Source') {
-                    Add-Finding 'Microsoft.Winget.Source NOT registered for SYSTEM - winget sources will be rebuilt in-memory every call'
+                catch {
+                    Write-Log ("   {0,-40} : query error - {1}" -f $pkgName, $_.Exception.Message) 'WARN'
                 }
             }
+        }
+        catch {
+            Write-Log ("Could not check SID {0}: {1}" -f $sid, $_.Exception.Message) 'WARN'
         }
     }
 }

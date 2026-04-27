@@ -109,6 +109,45 @@ function Get-WingetPath {
     return $wingetPath
 }
 
+function Repair-WingetForSystem {
+    # The winget hang ("Waiting for another install/uninstall to complete...") is
+    # almost never about MSI. The real cause on managed endpoints is a failed COM
+    # activation of WindowsPackageManagerServer.exe when the AppX package
+    # Microsoft.DesktopAppInstaller is not registered for the SYSTEM principal.
+    # We:
+    #   1. Kill any leftover winget / WindowsPackageManagerServer hanging from a
+    #      previous failed run (their stale handles can block a new attempt).
+    #   2. Re-register DesktopAppInstaller (and Winget.Source if available) from
+    #      the AppxManifest.xml present under C:\Program Files\WindowsApps.
+    #      Running as SYSTEM, Add-AppxPackage -Register registers for the SYSTEM
+    #      principal, which is what COM activation needs.
+    Write-Log "Pre-flight: cleaning up stale winget processes" 'INFO'
+    Get-Process -Name 'winget','WindowsPackageManagerServer' -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            Stop-Process -Id $_.Id -Force -ErrorAction Stop
+            Write-Log "Stopped stale process $($_.ProcessName) PID=$($_.Id)" 'WARN'
+        } catch {
+            Write-Log "Could not stop $($_.ProcessName) PID=$($_.Id): $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    Write-Log "Pre-flight: ensuring DesktopAppInstaller is registered for SYSTEM" 'INFO'
+    foreach ($pkgFilter in @('Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe','Microsoft.Winget.Source_*_neutral_*__8wekyb3d8bbwe')) {
+        $folders = @(Get-ChildItem 'C:\Program Files\WindowsApps' -Directory -Filter $pkgFilter -ErrorAction SilentlyContinue |
+                     Sort-Object Name -Descending | Select-Object -First 1)
+        foreach ($f in $folders) {
+            $manifest = Join-Path $f.FullName 'AppxManifest.xml'
+            if (-not (Test-Path $manifest)) { continue }
+            try {
+                Add-AppxPackage -DisableDevelopmentMode -Register $manifest -ErrorAction Stop
+                Write-Log "Registered $($f.Name)" 'OK'
+            } catch {
+                Write-Log "Could not register $($f.Name): $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+}
+
 function Ensure-MsiServiceRunning {
     # Winget acquires the Windows Installer _MSIExecute mutex before any install
     # (even non-MSI installers like Inno Setup / NSIS), and the mutex is only
@@ -283,22 +322,23 @@ function Get-MsiStuckStateDiagnostic {
     }
 
     # Critical: is DesktopAppInstaller registered for SYSTEM? If not, winget as
-    # SYSTEM can't activate its COM server and will hang.
-    try {
-        $sysPkg = Get-AppxPackage -User 'S-1-5-18' -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($sysPkg) {
-            $diag.Add("DesktopAppInstaller for SYSTEM: v$($sysPkg.Version) [$($sysPkg.Status)]") | Out-Null
-        } else {
-            $diag.Add("DesktopAppInstaller for SYSTEM: NOT REGISTERED - root cause candidate") | Out-Null
+    # SYSTEM can't activate its COM server (WindowsPackageManagerServer) and
+    # hangs forever showing the misleading "Waiting for another install" message.
+    # Get-AppxPackage -User accepts S-1-5-18 OR 'NT AUTHORITY\SYSTEM' depending on
+    # Windows build; try both and tolerate terminating errors.
+    foreach ($pkgName in @('Microsoft.DesktopAppInstaller','Microsoft.Winget.Source')) {
+        $found = $null
+        foreach ($userId in @('NT AUTHORITY\SYSTEM','S-1-5-18')) {
+            try {
+                $found = Get-AppxPackage -User $userId -Name $pkgName -ErrorAction Stop | Select-Object -First 1
+                break
+            } catch {}
         }
-        $srcPkg = Get-AppxPackage -User 'S-1-5-18' -Name 'Microsoft.Winget.Source' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($srcPkg) {
-            $diag.Add("Winget.Source for SYSTEM: v$($srcPkg.Version) [$($srcPkg.Status)]") | Out-Null
+        if ($found) {
+            $diag.Add("$pkgName for SYSTEM: v$($found.Version) [$($found.Status)]") | Out-Null
         } else {
-            $diag.Add("Winget.Source for SYSTEM: NOT REGISTERED") | Out-Null
+            $diag.Add("$pkgName for SYSTEM: NOT REGISTERED") | Out-Null
         }
-    } catch {
-        $diag.Add("Per-SID AppX check error: $($_.Exception.Message)") | Out-Null
     }
 
     # msiexec processes (always log count, even 0)
@@ -560,10 +600,12 @@ try {
     $WingetPath = Get-WingetPath
     Write-Log "Winget located at : $WingetPath" 'OK'
 
-    # Pre-flight: make sure msiserver is Running so winget does not hang on
-    # "Waiting for another install/uninstall to complete" when it acquires
-    # the MSI mutex (required even for non-MSI installer types).
+    # Pre-flight: make sure msiserver is Running and that DesktopAppInstaller is
+    # registered for SYSTEM. The latter is what actually unblocks the winget COM
+    # activation - the "Waiting for another install/uninstall to complete..."
+    # message is winget's misleading fallback when its COM server fails to start.
     Ensure-MsiServiceRunning | Out-Null
+    Repair-WingetForSystem
 
     foreach ($App in $Applications) {
         $PackageId         = $App.Id
