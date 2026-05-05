@@ -39,12 +39,19 @@ $Applications = @(
         Mandatory = $false
         ProcessNames = @('RemoteDesktopManager*')
         TimeoutSeconds = 1200
+        # MSI silent install args. Required to bypass winget's COM-based MSI
+        # invocation under SYSTEM (which hangs without dep-resolution context).
+        # MSIRESTARTMANAGERCONTROL=Disable avoids files-in-use stalling.
+        InstallerOverride = '/quiet /norestart REBOOT=ReallySuppress MSIRESTARTMANAGERCONTROL=Disable'
     },
     @{
         Id = 'Notepad++.Notepad++'
         Name = 'Notepad++'
         Mandatory = $false
         ProcessNames = @('notepad++')
+        # NSIS silent flag. Same rationale as RDM: --override forces winget to
+        # spawn the installer directly instead of going through COM.
+        InstallerOverride = '/S'
     }
     #@{
     #    Id = 'Microsoft.DotNet.SDK.8'
@@ -110,17 +117,18 @@ function Get-WingetPath {
 }
 
 function Repair-WingetForSystem {
-    # The winget hang ("Waiting for another install/uninstall to complete...") is
-    # almost never about MSI. The real cause on managed endpoints is a failed COM
-    # activation of WindowsPackageManagerServer.exe when the AppX package
-    # Microsoft.DesktopAppInstaller is not registered for the SYSTEM principal.
-    # We:
-    #   1. Kill any leftover winget / WindowsPackageManagerServer hanging from a
-    #      previous failed run (their stale handles can block a new attempt).
-    #   2. Re-register DesktopAppInstaller (and Winget.Source if available) from
-    #      the AppxManifest.xml present under C:\Program Files\WindowsApps.
-    #      Running as SYSTEM, Add-AppxPackage -Register registers for the SYSTEM
-    #      principal, which is what COM activation needs.
+    # Pre-flight repair to prevent the "Waiting for another install/uninstall to
+    # complete..." hang that is actually a failed COM activation of
+    # WindowsPackageManagerServer.exe (NOT an MSI mutex issue). Steps:
+    #   1. Kill stale winget / WindowsPackageManagerServer from a previous run
+    #      (their dead handles can block a new COM activation).
+    #   2. Clear winget temp folders that could carry a "pending operation" marker.
+    #   3. Bounce msiserver to escape a stuck-but-Running state.
+    #   4. Try Add-AppxPackage -RegisterByFamilyName: this code path is allowed
+    #      for SYSTEM (unlike -Register <manifest>) because it operates on an
+    #      already-staged package without going through the bundle manifest.
+
+    # 1. Kill stale processes
     Write-Log "Pre-flight: cleaning up stale winget processes" 'INFO'
     Get-Process -Name 'winget','WindowsPackageManagerServer' -ErrorAction SilentlyContinue | ForEach-Object {
         try {
@@ -131,19 +139,50 @@ function Repair-WingetForSystem {
         }
     }
 
-    Write-Log "Pre-flight: ensuring DesktopAppInstaller is registered for SYSTEM" 'INFO'
-    foreach ($pkgFilter in @('Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe','Microsoft.Winget.Source_*_neutral_*__8wekyb3d8bbwe')) {
-        $folders = @(Get-ChildItem 'C:\Program Files\WindowsApps' -Directory -Filter $pkgFilter -ErrorAction SilentlyContinue |
-                     Sort-Object Name -Descending | Select-Object -First 1)
-        foreach ($f in $folders) {
-            $manifest = Join-Path $f.FullName 'AppxManifest.xml'
-            if (-not (Test-Path $manifest)) { continue }
+    # 2. Clear winget temp folders (stale lock markers)
+    Write-Log "Pre-flight: clearing winget temp folders" 'INFO'
+    $tempBases = @(
+        "$env:WINDIR\Temp\WinGet",
+        "$env:WINDIR\System32\config\systemprofile\AppData\Local\Temp\WinGet"
+    )
+    foreach ($tb in $tempBases) {
+        if (Test-Path $tb) {
             try {
-                Add-AppxPackage -DisableDevelopmentMode -Register $manifest -ErrorAction Stop
-                Write-Log "Registered $($f.Name)" 'OK'
+                Get-ChildItem -Path $tb -Recurse -Force -ErrorAction SilentlyContinue |
+                    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Log "Cleared $tb" 'OK'
             } catch {
-                Write-Log "Could not register $($f.Name): $($_.Exception.Message)" 'WARN'
+                Write-Log "Could not clear ${tb}: $($_.Exception.Message)" 'WARN'
             }
+        }
+    }
+
+    # 3. Bounce msiserver (stop+start beats running-but-stuck)
+    Write-Log "Pre-flight: restarting msiserver" 'INFO'
+    try {
+        Stop-Service -Name 'msiserver' -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+        Start-Service -Name 'msiserver' -ErrorAction SilentlyContinue
+        $svc = Get-Service -Name 'msiserver' -ErrorAction SilentlyContinue
+        Write-Log "msiserver after bounce: $($svc.Status)" 'OK'
+    } catch {
+        Write-Log "msiserver bounce failed: $($_.Exception.Message)" 'WARN'
+    }
+
+    # 4. Re-register key AppX packages by family name (allowed for SYSTEM,
+    # unlike Register <manifest> which Microsoft rejects from Local System).
+    Write-Log "Pre-flight: registering AppX by family name (SYSTEM-compatible path)" 'INFO'
+    $families = @(
+        'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe',
+        'Microsoft.Winget.Source_8wekyb3d8bbwe',
+        'Microsoft.WindowsAppRuntime.1.8_8wekyb3d8bbwe'
+    )
+    foreach ($fam in $families) {
+        try {
+            Add-AppxPackage -RegisterByFamilyName -MainPackage $fam -ErrorAction Stop
+            Write-Log "Registered by family name: $fam" 'OK'
+        } catch {
+            Write-Log "RegisterByFamilyName failed for ${fam}: $($_.Exception.Message)" 'WARN'
         }
     }
 }
@@ -549,7 +588,9 @@ function Invoke-WingetInstall {
     )
 
     # --scope machine intentionally kept: new installs should be machine-wide.
-    $arguments = "install --id `"$PackageId`" --exact --source winget --scope machine --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"
+    # --skip-dependencies: same reason as in Invoke-WingetUpgrade (avoid COM
+    # activation of WindowsPackageManagerServer that hangs under SYSTEM).
+    $arguments = "install --id `"$PackageId`" --exact --source winget --scope machine --silent --skip-dependencies --accept-package-agreements --accept-source-agreements --disable-interactivity"
 
     if ($Override) {
         $arguments += " --override `"$Override`""
@@ -568,9 +609,22 @@ function Invoke-WingetUpgrade {
         [int]$TimeoutSeconds = 600
     )
 
-    # --scope machine omitted on upgrade: forcing it can conflict when the existing
-    # install is user-scope, and winget matches the existing scope automatically.
-    $arguments = "upgrade --id `"$PackageId`" --exact --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"
+    # IMPORTANT: we use 'install --force' instead of 'upgrade' deliberately.
+    # 'winget upgrade' uses additional COM interfaces (UpgradeFlow / IDesiredVersion /
+    # IPackageVersion ranking) that fail to activate under SYSTEM and hang on
+    # "Waiting for another install/uninstall to complete...". 'install --force'
+    # uses the simpler InstallFlow which works reliably from SYSTEM.
+    #
+    # --skip-dependencies is critical: dep resolution forces winget to use
+    # WindowsPackageManagerServer (COM activation that fails under SYSTEM).
+    # Skipping it requires the caller to ensure dependencies are deployed
+    # separately (e.g. via Intune Win32 app for Microsoft.DotNet.DesktopRuntime).
+    #
+    # --override is also key: it makes winget bypass its manifest-based
+    # installer-switch lookup (another COM path) and just spawn the installer
+    # with the literal args we provide. This is the proven Intune Win32 LOB
+    # pattern that works reliably from SYSTEM.
+    $arguments = "install --id `"$PackageId`" --exact --source winget --silent --force --skip-dependencies --accept-package-agreements --accept-source-agreements --disable-interactivity"
 
     if ($Override) {
         $arguments += " --override `"$Override`""
